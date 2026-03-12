@@ -1,0 +1,478 @@
+# Code for paper : Behavioural and environmental factors associated with human tick bites risk in the Grippenet/Covidnet cohort in France
+# Upload date : 2026-03-12
+
+library(dplyr)
+library(sf)
+library(stringr)
+library(tidyr)
+library(binom) 
+
+# data = Grippenet/Covidnet survey data
+
+
+##### Incidence estimation #####
+
+######* Survey data ######
+
+data_over20 <- data %>%
+  filter(age_cor >= 20) 
+
+
+data_over20 <- data_over20 %>%
+  mutate(age_group = case_when(age_cor >= 20 & age_cor <= 34 ~ "20-34",
+                               age_cor >= 35 & age_cor <= 49 ~ "35-49",
+                               age_cor >= 50 & age_cor <= 64 ~ "50-64",
+                               age_cor >= 65 & age_cor <= 79 ~ "65-79",
+                               age_cor >= 80 ~ "80 and older",
+                               TRUE ~ NA)) %>%
+  mutate(age_group = factor(age_group, levels = c("20-34","35-49","50-64","65-79","80 and older"))) %>%
+  mutate(SEX = case_when(gender_binary == 0 ~ "M",
+                         gender_binary == 1 ~ "F",
+                         TRUE ~ NA),
+         SEX = factor(SEX, levels = c("F","M"))
+  )
+
+
+
+######* French population ######
+
+# Population data in 2025 
+# download from : https://catalogue-donnees.insee.fr/fr/catalogue/recherche/DS_ESTIMATION_POPULATION 
+
+# Population per department 
+pop_DEP <- pop %>%
+  filter(TIME_PERIOD >= 2022 & TIME_PERIOD <= 2025,
+         GEO_OBJECT == "DEP",
+         SEX %in% c("F", "M"),
+         AGE %in% c("Y_LT5", "Y5T9", "Y10T14", "Y15T19", "Y20T24", "Y25T29", 
+                    "Y30T34", "Y35T39", "Y40T44", "Y45T49", "Y50T54", "Y55T59", "Y60T64", 
+                    "Y65T69", "Y70T74", "Y75T79", "Y80T84", "Y85T89", "Y90T94", "Y_GE95"),
+         EP_MEASURE == "POP"
+  ) %>%
+  select(DEP = GEO, AGE, SEX, YEAR = TIME_PERIOD, POP = OBS_VALUE) %>%
+  mutate(SEX = as.factor(SEX),
+         AGE = factor(AGE,
+                      levels = c("Y_LT5", "Y5T9", "Y10T14", "Y15T19", "Y20T24", "Y25T29",
+                                 "Y30T34", "Y35T39", "Y40T44", "Y45T49", "Y50T54", "Y55T59", "Y60T64",
+                                 "Y65T69", "Y70T74", "Y75T79", "Y80T84", "Y85T89", "Y90T94", "Y_GE95"),
+                      labels = c("< 5", "5-9", "10-14", "15-19", "20-24", "25-29", 
+                                 "30-34", "35-39", "40-44", "45-49", "50-54", "55-59", "60-64", 
+                                 "65-69", "70-74", "75-79", "80-84", "85-89", "90-94", ">= 95"))
+  ) %>%
+  filter(DEP < 96)
+
+# Correspondence department and region
+# download from : https://geoservices.ign.fr/adminexpress
+
+map_dept <- st_read("ADMIN-EXPRESS_3-2__SHP_LAMB93_FXX_2023-10-16/ADMIN-EXPRESS/1_DONNEES_LIVRAISON_2023-10-16/ADE_3-2_SHP_LAMB93_FXX/DEPARTEMENT.shp")
+
+dep_reg <- map_dept %>%
+  st_drop_geometry(geometry) %>%
+  select(CODE_DEPT=INSEE_DEP, CODE_REG=INSEE_REG) %>% 
+  mutate(CODE_DEPT = as.factor(CODE_DEPT),
+         CODE_REG = as.factor(CODE_REG))
+
+# Population per region
+pop_merge <- merge(pop_DEP, dep_reg, by.x = "DEP", by.y = "CODE_DEPT", all.x = TRUE)
+
+pop_REG <- pop_merge %>%
+  group_by(CODE_REG, AGE, SEX, YEAR) %>%
+  summarise(POP = sum(POP))
+
+pop_REG_2025 <- pop_REG %>%
+  filter(YEAR == 2025)
+
+# Grouped by age
+pop_grouped_over20 <- pop_REG_2025 %>%
+  mutate(age_group = case_when(
+    AGE %in% c("< 5", "5-9", "10-14", "15-19") ~ "Under 20",
+    AGE %in% c("20-24", "25-29", "30-34") ~ "20-34",
+    AGE %in% c("35-39", "40-44", "45-49") ~ "35-49",
+    AGE %in% c("50-54", "55-59", "60-64") ~ "50-64",
+    AGE %in% c("65-69", "70-74", "75-79") ~ "65-79",
+    AGE %in% c("80-84", "85-89", "90-94", ">= 95") ~ "80 and older",
+    TRUE ~ NA
+  ))
+
+## population per region
+pop_ref_20plus <- pop_grouped_over20 %>%
+  filter(age_group != "Under 20") %>%
+  group_by(CODE_REG) %>%
+  summarise(POP = sum(POP))
+
+pop_ref_20plus$POP_FR <- sum(pop_ref_20plus$POP)
+
+
+######* Post stratification weight ######
+
+
+# Proportion of certain age-sex group in French population
+pop_FR_age_sex <- pop_grouped_over20 %>%
+  filter(age_group != "Under 20") %>%
+  droplevels() %>%
+  group_by(SEX, age_group) %>%
+  summarise(POP = sum(POP), .groups = "drop") %>%
+  mutate(POP_total = sum(POP),
+         prop_POP = POP / POP_total)
+
+
+# Unique participants per age group and sex
+unique_par_age_sex <- data_over20 %>%
+  arrange(version_date) %>%
+  group_by(participantID) %>%
+  summarise(
+    age_group = first(age_group),
+    SEX = first(SEX),   
+    .groups = "drop"
+  )
+
+# Proportion of certain age-sex group in survey data
+participant_age_sex <- unique_par_age_sex %>%
+  group_by(SEX, age_group) %>%
+  summarise(n_par = n(), .groups = "drop") %>%
+  mutate(n_total = sum(n_par),
+         prop_par = n_par / n_total)
+
+
+### post stratification weight
+post_stra <- participant_age_sex %>%
+  left_join(pop_FR_age_sex, by = c("SEX", "age_group")) %>%
+  mutate(weight = prop_POP / prop_par)
+
+
+# Assign the weight to each participantID
+unique_par_age_sex_w <- unique_par_age_sex %>%
+  left_join(
+    post_stra %>% select(SEX, age_group, weight),
+    by = c("SEX", "age_group")
+  )
+
+# Add the weight to the data 
+data_over20_weight <- data_over20 %>%
+  left_join(unique_par_age_sex_w %>%
+              select(participantID, weight),
+            by = "participantID")
+
+
+######* Participants per year per region ######
+
+# 1 epidemiological year = 3 surveys (March-June, July-October, November-February)
+
+# spring = March-June
+# summer = July-October
+# winter = November-February
+
+par_year_reg <- data_over20_weight %>%
+  mutate(
+    annual_period = case_when(
+      survey_id == "winter_22" ~ "annual_22",
+      survey_id %in% c("spring_23", "summer_23", "winter_23") ~ "annual_23",
+      survey_id %in% c("spring_24", "summer_24", "winter_24") ~ "annual_24",
+      TRUE ~ NA
+    )
+  ) %>%
+  # collapse to unique participant per year & region
+  group_by(participantID, CODE_REG, annual_period) %>%
+  summarise(weight = first(weight), .groups = "drop") %>%   
+  # sum by region
+  group_by(CODE_REG, annual_period) %>%
+  summarise(
+    n_par = n(),              # number of participants
+    n_par_w = sum(weight),    # number of weighted participants
+    .groups = "drop"
+  ) %>%
+  filter(annual_period != "annual_22") 
+
+
+######* Location of tick bites ######
+
+# Extract the departments for all tick bite episodes
+tb_dept <- data_over20_weight %>%
+  filter(bitten_study_period == 1) %>%
+  mutate(
+    # Extract department for each episode (P1 to P4)
+    P1_dept = case_when(
+      !is.na(P1_department) ~ str_pad(P1_department, width = 2, side = "left", pad = "0"),  # Add leading 0 if less than 2 characters
+      !is.na(P1_postcode) ~ substr(str_pad(P1_postcode, width = 5, side = "left", pad = "0"), 1, 2),  # Ensure postcode is 5 digits and take first 2
+      TRUE ~ NA_character_  # If both are missing, set to NA
+    )
+  ) %>%
+  mutate(
+    P2_dept = case_when(
+      !is.na(P2_department) ~ str_pad(P2_department, width = 2, side = "left", pad = "0"),  # Add leading 0 if less than 2 characters
+      !is.na(P2_postcode) ~ substr(str_pad(P2_postcode, width = 5, side = "left", pad = "0"), 1, 2),
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  mutate(
+    P3_dept = case_when(
+      !is.na(P3_department) ~ str_pad(P3_department, width = 2, side = "left", pad = "0"),
+      !is.na(P3_postcode) ~ substr(str_pad(P3_postcode, width = 5, side = "left", pad = "0"), 1, 2),
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  mutate(
+    P4_dept = case_when(
+      !is.na(P4_department) ~ str_pad(P4_department, width = 2, side = "left", pad = "0"),
+      !is.na(P4_postcode) ~ substr(str_pad(P4_postcode, width = 5, side = "left", pad = "0"), 1, 2),
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(participantID, survey_id, nb_bite, weight, region_residence = CODE_REG, res_dept, P1_dept, P2_dept, P3_dept, P4_dept)
+
+
+tb_long <- tb_dept %>%
+  pivot_longer(
+    cols = matches("^P[1-4]_dept$"),
+    names_to = c("episode", ".value"),
+    names_pattern = "P([1-4])_(.*)"
+  ) %>%
+  filter(nb_bite != 99) %>%
+  filter(as.numeric(episode) <= nb_bite)
+
+# Region of tick bites
+tb_reg <- tb_long %>%
+  mutate(region_residence = as.factor(region_residence)) %>%
+  left_join(dep_reg, by = c("dept" = "CODE_DEPT")) %>%
+  rename(region_bitten = CODE_REG) %>%
+  select(- res_dept, - dept)
+
+
+tb_reg_year <- tb_reg %>%
+  filter(! is.na(region_bitten)) %>%
+  mutate(region_bitten = droplevels(region_bitten)) %>%
+  mutate(
+    annual_period = case_when(
+      survey_id == "winter_22" ~ "annual_22",
+      survey_id %in% c("spring_23", "summer_23", "winter_23") ~ "annual_23",   
+      survey_id %in% c("spring_24", "summer_24", "winter_24") ~ "annual_24",
+      TRUE ~ NA
+    )) %>%
+  mutate(bitten_in_home_region = region_residence == region_bitten)
+# check whether participants were bitten in their region of residence
+
+# focus on epidemiological year 2023 and 2024
+tb_reg_year_2324 <- tb_reg_year %>%
+  filter(annual_period != "annual_22")
+
+# bitten at least once in the region of residence in a year
+participant_year <- tb_reg_year_2324 %>%
+  group_by(participantID, annual_period, region_residence) %>%
+  summarise(
+    bitten_in_res_region = as.integer(any(bitten_in_home_region)),  
+    weight = first(weight),
+    .groups = "drop"
+  )
+
+
+######* Bitten participants per year per region ######
+
+cases_region_year <- participant_year %>%
+  group_by(region_residence, annual_period) %>%
+  summarise(
+    n_case = sum(bitten_in_res_region),                # number of bitten participants
+    n_case_w = sum(weight * bitten_in_res_region),     # number of weighted bitten participants
+    .groups = "drop"
+  )
+
+
+######* Merge data to calculate the incidence ######
+
+merged_data_within_year <- par_year_reg %>%
+  mutate(CODE_REG = as.factor(CODE_REG)) %>%
+  left_join(
+    cases_region_year,
+    by = c("CODE_REG"="region_residence", "annual_period")
+  ) %>%
+  mutate(n_case = replace_na(n_case, 0),
+         n_case_w = replace_na(n_case_w, 0))
+
+inc_data <- merged_data_within_year %>%
+  left_join(pop_ref_20plus, by="CODE_REG")
+
+
+
+######* Yearly incidence per region ######
+
+inc_year_reg <- inc_data %>%
+  rowwise() %>%
+  mutate(
+    # with post stratification weight
+    # proportion of bitten individual among participant
+    rate_w = n_case_w / n_par_w,
+
+    ci_w = list(binom.confint(n_case_w, n_par_w, method = "wilson")),
+    ci_low_w = ci_w$lower,
+    ci_up_w  = ci_w$upper,
+    
+    # estimate bitten individual in population
+    bitten_pop_w = rate_w * POP,
+    bitten_pop_low_w = ci_low_w * POP,
+    bitten_pop_up_w = ci_up_w * POP,
+    
+    # incidence per 100,000 
+    inc_ar_100_w = round(bitten_pop_w / POP * 100000, 2),
+    ci_low_100_w = round(bitten_pop_low_w / POP * 100000, 2),
+    ci_up_100_w = round(bitten_pop_up_w / POP * 100000, 2),
+  )
+
+
+######* National yearly incidence ######
+
+inc_year_nat <- inc_year_reg %>%
+  # adjust regional incidence according to the population size
+  mutate(inc_ar_100_w_adj = inc_ar_100_w * POP / POP_FR,
+         ci_low_100_w_adj = ci_low_100_w * POP / POP_FR,
+         ci_up_100_w_adj = ci_up_100_w * POP / POP_FR) %>%
+  group_by(annual_period) %>%
+  summarise(inc_nat_100_w = sum(inc_ar_100_w_adj),
+            ci_low_100_w = sum(ci_low_100_w_adj),
+            ci_up_100_w = sum(ci_up_100_w_adj))  
+
+
+
+##### Bayesian hierarchical model #####
+
+library(INLA)
+
+data_model <- data %>%
+  select(participantID, survey_id, survey_no, bitten_binary, nb_bite_NEW, season, 
+         age=age_group30, sex=gender_binary, res_green_outdoor, res_garden, res_field, res_terrace, res_no_outdoor, CODE_REG,
+         temp=temp_group, rh=rh_group, sd=sd_group, clc_for=clc_forest10, clc_agri=clc_agriculture10, clc_arti=clc_artificial10,
+         starts_with("env_"), starts_with("type_"), freq_activity_imputed, freq_preventive_3lv,
+         consult_gp, consult_gp_at_least_1, remove_timing, starts_with("bitten_env_"), starts_with("bit_act_"))
+
+data_model$CODE_REG <- factor(data_model$CODE_REG)
+
+# Binomial
+data_bin <- data_model
+# Poisson part
+data_pois <- subset(data_model, nb_bite_NEW > 0)
+
+
+######* INLA stacks ######
+
+# stack for binomial part
+stack_B <- inla.stack(data=list(Y=data_bin$bitten_binary), 
+                      A=1,
+                      effects=list(
+                        Inte_B = rep(1, dim(data_bin)[1]),
+                        age_B_45_74  = as.numeric(data_bin$age=="45-74"),
+                        age_B_75_plus  = as.numeric(data_bin$age=="75 and older"),
+                        sex_B_F = data_bin$sex,   # it's already 0/1
+                        res_green_outdoor_B = as.numeric(data_bin$res_green_outdoor),
+                        
+                        region_B_24 = as.numeric(data_bin$CODE_REG=="24"),
+                        region_B_27 = as.numeric(data_bin$CODE_REG=="27"),
+                        region_B_28 = as.numeric(data_bin$CODE_REG=="28"),
+                        region_B_32 = as.numeric(data_bin$CODE_REG=="32"),
+                        region_B_44 = as.numeric(data_bin$CODE_REG=="44"),
+                        region_B_52 = as.numeric(data_bin$CODE_REG=="52"),
+                        region_B_53 = as.numeric(data_bin$CODE_REG=="53"),
+                        region_B_75 = as.numeric(data_bin$CODE_REG=="75"),
+                        region_B_76 = as.numeric(data_bin$CODE_REG=="76"),
+                        region_B_84 = as.numeric(data_bin$CODE_REG=="84"),
+                        region_B_93 = as.numeric(data_bin$CODE_REG=="93"),
+                        region_B_94 = as.numeric(data_bin$CODE_REG=="94"),
+                        
+                        temp_B_2 = as.numeric(data_bin$temp=="> 7 - ≤ 13"),
+                        temp_B_3 = as.numeric(data_bin$temp=="> 13 - ≤ 17"),
+                        temp_B_4 = as.numeric(data_bin$temp=="> 17"),
+                        rh_B_2 = as.numeric(data_bin$rh=="> 72% - ≤ 77%"),
+                        rh_B_3 = as.numeric(data_bin$rh=="> 77% - ≤ 84%"),
+                        rh_B_4 = as.numeric(data_bin$rh=="> 84%"),
+                        sd_B_2 = as.numeric(data_bin$sd=="> 1.2 - ≤ 2.7"),
+                        sd_B_3 = as.numeric(data_bin$sd=="> 2.7 - ≤ 3.8"),
+                        sd_B_4 = as.numeric(data_bin$sd=="> 3.8"),
+                        clc_for_B = data_bin$clc_for,
+                        clc_agri_B = data_bin$clc_agri,
+                        clc_arti_B = data_bin$clc_arti,
+                        
+                        env_forest_B = as.numeric(data_bin$env_forest),
+                        env_meadow_B = as.numeric(data_bin$env_meadow),
+                        env_garden_B = as.numeric(data_bin$env_garden),
+                        env_agri_B = as.numeric(data_bin$env_agri),
+                        env_park_B = as.numeric(data_bin$env_park),
+                        env_mount_B = as.numeric(data_bin$env_mount),
+                        freq_act_B_2  = as.numeric(data_bin$freq_activity_imputed=="1-2 times/month"),
+                        freq_act_B_3  = as.numeric(data_bin$freq_activity_imputed=="Once/week"),
+                        freq_act_B_4  = as.numeric(data_bin$freq_activity_imputed=="2-3 times/week"),
+                        freq_act_B_5  = as.numeric(data_bin$freq_activity_imputed=="Everyday"),
+                        freq_prev_B_2 = as.numeric(data_bin$freq_preventive_3lv=="Sometimes"),
+                        freq_prev_B_3 = as.numeric(data_bin$freq_preventive_3lv=="Always"),
+                        # shared random effects
+                        survey_id = data_bin$survey_id,
+                        par_id = data_bin$participantID
+                      ),
+                      tag = "bin") 
+
+# stack for Poisson part
+stack_P <- inla.stack(data=list(Y2=data_pois$nb_bite_NEW),
+                      A=1,
+                      effects=list(
+                        Inte_P = rep(1, dim(data_pois)[1]),
+                        clc_for_P = data_pois$clc_for,
+                        clc_agri_P = data_pois$clc_agri,
+                        clc_arti_P = data_pois$clc_arti,
+                        
+                        bitten_env_forest_P = as.numeric(data_pois$bitten_env_forest),
+                        bitten_env_meadow_P = as.numeric(data_pois$bitten_env_meadow),
+                        bitten_env_garden_P = as.numeric(data_pois$bitten_env_garden),
+                        bitten_env_agri_P = as.numeric(data_pois$bitten_env_agri),
+                        bitten_env_park_P = as.numeric(data_pois$bitten_env_park),
+                        bitten_env_int_P = as.numeric(data_pois$bitten_env_int),
+                        bitten_env_farm_P = as.numeric(data_pois$bitten_env_farm),
+                        bitten_env_water_P = as.numeric(data_pois$bitten_env_water),
+                        
+                        bit_act_prof_P = as.numeric(data_pois$bit_act_prof),
+                        bit_act_hunt_fish_P = as.numeric(data_pois$bit_act_hunt_fish),
+                        bit_act_sport_P = as.numeric(data_pois$bit_act_sport),
+                        bit_act_leisure_P = as.numeric(data_pois$bit_act_leisure),
+                        
+                        freq_act_P_2  = as.numeric(data_pois$freq_activity_imputed=="1-2 times/month"),
+                        freq_act_P_3  = as.numeric(data_pois$freq_activity_imputed=="Once/week"),
+                        freq_act_P_4  = as.numeric(data_pois$freq_activity_imputed=="2-3 times/week"),
+                        freq_act_P_5  = as.numeric(data_pois$freq_activity_imputed=="Everyday"),
+                        freq_prev_P_2 = as.numeric(data_pois$freq_preventive_3lv=="Sometimes"),
+                        freq_prev_P_3 = as.numeric(data_pois$freq_preventive_3lv=="Always"),
+                        
+                        consult_gp_P = as.numeric(data_pois$consult_gp_at_least_1=="Yes"),
+                        remove_tick_P_2 = as.numeric(data_pois$remove_timing=="After 24h"),
+                        remove_tick_P_3 = as.numeric(data_pois$remove_timing=="Other"),
+                        # shared random effects
+                        survey_id = data_pois$survey_id,
+                        par_id = data_pois$participantID
+                      ),
+                      tag = "pois") 
+
+
+# Join both stacks
+stack_BP <- inla.stack.join(stack_B, stack_P)
+
+######* INLA model ######
+
+# Variables selection
+formula <- list(Y,Y2) ~ -1 + Inte_B + Inte_P + 
+  # Binomial
+  age_B_45_74 + age_B_75_plus + sex_B_F + res_green_outdoor_B + region_B_24 + region_B_27 + region_B_28 + region_B_32 +
+  region_B_44 + region_B_52 + region_B_53 + region_B_75 + region_B_76 + region_B_84 + region_B_93 + region_B_94 +
+  temp_B_2 + temp_B_3 + temp_B_4 + rh_B_2 + rh_B_3 + rh_B_4 + clc_for_B + clc_agri_B + clc_arti_B +
+  env_forest_B + env_meadow_B + env_garden_B + env_agri_B + env_park_B + env_mount_B +
+  freq_act_B_2 + freq_act_B_3 + freq_act_B_4 + freq_act_B_5 + freq_prev_B_2 + freq_prev_B_3 +
+  # Poisson
+  clc_for_P + clc_agri_P + bitten_env_forest_P + bitten_env_meadow_P + bitten_env_garden_P + 
+  bitten_env_agri_P + bitten_env_park_P + bitten_env_int_P + bitten_env_farm_P + bitten_env_water_P + 
+  bit_act_prof_P + bit_act_hunt_fish_P + bit_act_sport_P + bit_act_leisure_P +
+  freq_act_P_2 + freq_act_P_3 + freq_act_P_4 + freq_act_P_5 + freq_prev_P_2 + freq_prev_P_3 +
+  consult_gp_P + remove_tick_P_2 + remove_tick_P_3 +
+  # Random effects
+  f(par_id, model="iid") +
+  f(survey_id, model="seasonal", season.length=3)
+
+
+res <- inla(formula,
+            data=inla.stack.data(stack_BP),
+            family=c("binomial","nzpoisson"),
+            control.predictor=list(A=inla.stack.A(stack_BP), compute=TRUE),
+            control.compute=list(dic=TRUE, waic=TRUE, cpo=TRUE))
+
