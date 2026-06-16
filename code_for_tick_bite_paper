@@ -1,5 +1,6 @@
 # Code for paper : Behavioural and environmental factors associated with human tick bites risk in the Grippenet/Covidnet cohort in France
-# Upload date : 2026-03-12
+# Upload date : 12-03-2026
+# Last update : 16-06-2026
 
 library(dplyr)
 library(sf)
@@ -319,17 +320,19 @@ inc_year_reg <- inc_data %>%
 
 ######* National yearly incidence ######
 
-inc_year_nat <- inc_year_reg %>%
-  # adjust regional incidence according to the population size
-  mutate(inc_ar_100_w_adj = inc_ar_100_w * POP / POP_FR,
-         ci_low_100_w_adj = ci_low_100_w * POP / POP_FR,
-         ci_up_100_w_adj = ci_up_100_w * POP / POP_FR) %>%
+inc_year_nat_ALL <- inc_year_reg %>%
+  mutate(weight_region = POP/ POP_FR,    
+         SE_region = (ci_up_100_w - ci_low_100_w)/(2*1.96),
+         var_region = SE_region^2) %>%
+  mutate(inc_ar_100_w_adj = inc_ar_100_w * weight_region,
+         var_adj = var_region * weight_region^2) %>%
   group_by(annual_period) %>%
-  summarise(inc_nat_100_w = sum(inc_ar_100_w_adj),
-            ci_low_100_w = sum(ci_low_100_w_adj),
-            ci_up_100_w = sum(ci_up_100_w_adj))  
-
-
+  summarise(
+    var_national = sum(var_adj),
+    SE_national = sqrt(var_national),
+    inc_nat_100_w = sum(inc_ar_100_w_adj),
+    ci_low_100_w = inc_nat_100_w - (1.96 * SE_national),
+    ci_up_100_w = inc_nat_100_w + (1.96 * SE_national))
 
 ##### Bayesian hierarchical model #####
 
@@ -337,12 +340,18 @@ library(INLA)
 
 data_model <- data %>%
   select(participantID, survey_id, survey_no, bitten_binary, nb_bite_NEW, season, 
-         age=age_group30, sex=gender_binary, res_green_outdoor, res_garden, res_field, res_terrace, res_no_outdoor, CODE_REG,
-         temp=temp_group, rh=rh_group, sd=sd_group, clc_for=clc_forest10, clc_agri=clc_agriculture10, clc_arti=clc_artificial10,
+         age=age_group30, sex=gender_binary, res_green_outdoor, CODE_REG,
+         temp=temp_group, rh=rh_group, tp=precipitation_group, clc_for=clc_forest10, clc_agri=clc_agriculture10, clc_arti=clc_artificial10,
          starts_with("env_"), starts_with("type_"), freq_activity_imputed, freq_preventive_3lv,
-         consult_gp, consult_gp_at_least_1, remove_timing, starts_with("bitten_env_"), starts_with("bit_act_"))
+         consult_gp_at_least_1, remove_timing, starts_with("bitten_env_"), starts_with("bit_act_"))
 
 data_model$CODE_REG <- factor(data_model$CODE_REG)
+
+# starts_with("env_") = type of outdoor environments visited during study period
+# starts_with("type_") = type of outdoor activity performed during study period
+
+# starts_with("bitten_env_") = type of environments where tick bites were reported
+# starts_with("bit_act_")) = type of activities performed when tick bites were reported
 
 # Binomial
 data_bin <- data_model
@@ -381,9 +390,9 @@ stack_B <- inla.stack(data=list(Y=data_bin$bitten_binary),
                         rh_B_2 = as.numeric(data_bin$rh=="> 72% - ≤ 77%"),
                         rh_B_3 = as.numeric(data_bin$rh=="> 77% - ≤ 84%"),
                         rh_B_4 = as.numeric(data_bin$rh=="> 84%"),
-                        sd_B_2 = as.numeric(data_bin$sd=="> 1.2 - ≤ 2.7"),
-                        sd_B_3 = as.numeric(data_bin$sd=="> 2.7 - ≤ 3.8"),
-                        sd_B_4 = as.numeric(data_bin$sd=="> 3.8"),
+                        tp_B_2 = as.numeric(data_bin$tp=="> 2.3 - ≤ 2.6"),
+                        tp_B_3 = as.numeric(data_bin$tp=="> 2.6 - ≤ 3"),
+                        tp_B_4 = as.numeric(data_bin$tp=="> 3"),
                         clc_for_B = data_bin$clc_for,
                         clc_agri_B = data_bin$clc_agri,
                         clc_arti_B = data_bin$clc_arti,
@@ -394,8 +403,15 @@ stack_B <- inla.stack(data=list(Y=data_bin$bitten_binary),
                         env_agri_B = as.numeric(data_bin$env_agri),
                         env_park_B = as.numeric(data_bin$env_park),
                         env_mount_B = as.numeric(data_bin$env_mount),
-                        freq_act_B_2  = as.numeric(data_bin$freq_activity_imputed=="1-2 times/month"),
-                        freq_act_B_3  = as.numeric(data_bin$freq_activity_imputed=="Once/week"),
+
+                        type_pro_B = as.numeric(data_bin$type_pro),
+                        type_hunt_fish_B = as.numeric(data_bin$type_hunt_fish),
+                        type_sport_B = as.numeric(data_bin$type_sport),
+                        type_leisure_B = as.numeric(data_bin$type_leisure),
+                        type_other_B = as.numeric(data_bin$type_other),
+
+                        freq_act_B_1  = as.numeric(data_bin$freq_activity_imputed2=="Less than once/month"),
+                        freq_act_B_2  = as.numeric(data_bin$freq_activity_imputed2=="1-2 times/month"),
                         freq_act_B_4  = as.numeric(data_bin$freq_activity_imputed=="2-3 times/week"),
                         freq_act_B_5  = as.numeric(data_bin$freq_activity_imputed=="Everyday"),
                         freq_prev_B_2 = as.numeric(data_bin$freq_preventive_3lv=="Sometimes"),
@@ -411,9 +427,6 @@ stack_P <- inla.stack(data=list(Y2=data_pois$nb_bite_NEW),
                       A=1,
                       effects=list(
                         Inte_P = rep(1, dim(data_pois)[1]),
-                        clc_for_P = data_pois$clc_for,
-                        clc_agri_P = data_pois$clc_agri,
-                        clc_arti_P = data_pois$clc_arti,
                         
                         bitten_env_forest_P = as.numeric(data_pois$bitten_env_forest),
                         bitten_env_meadow_P = as.numeric(data_pois$bitten_env_meadow),
@@ -429,8 +442,8 @@ stack_P <- inla.stack(data=list(Y2=data_pois$nb_bite_NEW),
                         bit_act_sport_P = as.numeric(data_pois$bit_act_sport),
                         bit_act_leisure_P = as.numeric(data_pois$bit_act_leisure),
                         
-                        freq_act_P_2  = as.numeric(data_pois$freq_activity_imputed=="1-2 times/month"),
-                        freq_act_P_3  = as.numeric(data_pois$freq_activity_imputed=="Once/week"),
+                        freq_act_P_1  = as.numeric(data_pois$freq_activity_imputed2=="Less than once/month"),
+                        freq_act_P_2  = as.numeric(data_pois$freq_activity_imputed2=="1-2 times/month"),
                         freq_act_P_4  = as.numeric(data_pois$freq_activity_imputed=="2-3 times/week"),
                         freq_act_P_5  = as.numeric(data_pois$freq_activity_imputed=="Everyday"),
                         freq_prev_P_2 = as.numeric(data_pois$freq_preventive_3lv=="Sometimes"),
@@ -456,14 +469,15 @@ formula <- list(Y,Y2) ~ -1 + Inte_B + Inte_P +
   # Binomial
   age_B_45_74 + age_B_75_plus + sex_B_F + res_green_outdoor_B + region_B_24 + region_B_27 + region_B_28 + region_B_32 +
   region_B_44 + region_B_52 + region_B_53 + region_B_75 + region_B_76 + region_B_84 + region_B_93 + region_B_94 +
-  temp_B_2 + temp_B_3 + temp_B_4 + rh_B_2 + rh_B_3 + rh_B_4 + clc_for_B + clc_agri_B + clc_arti_B +
+  temp_B_2 + temp_B_3 + temp_B_4 + rh_B_2 + rh_B_3 + rh_B_4 + tp_B_2 + tp_B_3 + tp_B_4 + clc_for_B + clc_agri_B + clc_arti_B +
   env_forest_B + env_meadow_B + env_garden_B + env_agri_B + env_park_B + env_mount_B +
-  freq_act_B_2 + freq_act_B_3 + freq_act_B_4 + freq_act_B_5 + freq_prev_B_2 + freq_prev_B_3 +
+  type_pro_B + type_hunt_fish_B + type_sport_B + type_leisure_B +
+  freq_act_B_1 + freq_act_B_2 + freq_act_B_4 + freq_act_B_5 + freq_prev_B_2 + freq_prev_B_3 +
   # Poisson
-  clc_for_P + clc_agri_P + bitten_env_forest_P + bitten_env_meadow_P + bitten_env_garden_P + 
+  bitten_env_forest_P + bitten_env_meadow_P + bitten_env_garden_P + 
   bitten_env_agri_P + bitten_env_park_P + bitten_env_int_P + bitten_env_farm_P + bitten_env_water_P + 
   bit_act_prof_P + bit_act_hunt_fish_P + bit_act_sport_P + bit_act_leisure_P +
-  freq_act_P_2 + freq_act_P_3 + freq_act_P_4 + freq_act_P_5 + freq_prev_P_2 + freq_prev_P_3 +
+  freq_act_P_1 + freq_act_P_2 + freq_act_P_4 + freq_act_P_5 + freq_prev_P_2 + freq_prev_P_3 +
   consult_gp_P + remove_tick_P_2 + remove_tick_P_3 +
   # Random effects
   f(par_id, model="iid") +
@@ -473,6 +487,7 @@ formula <- list(Y,Y2) ~ -1 + Inte_B + Inte_P +
 res <- inla(formula,
             data=inla.stack.data(stack_BP),
             family=c("binomial","nzpoisson"),
+            control.fixed = list(mean = 0, prec = 1),
             control.predictor=list(A=inla.stack.A(stack_BP), compute=TRUE),
             control.compute=list(dic=TRUE, waic=TRUE, cpo=TRUE))
 
